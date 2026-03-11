@@ -176,68 +176,87 @@ for DOMAIN in "${ALL_DOMAINS[@]}"; do
     if grep -qi "operation in progress" "$ERR_TMP" 2>/dev/null && [[ $CANCEL_PENDING -eq 1 ]]; then
       echo "Pending transfer detected for $DOMAIN; cancelling (--cancel-pending)..."
 
-      # cancel-domain-transfer-to-another-aws-account is asynchronous; capture its OperationId
-      # so we can poll get-operation-detail and wait for the cancellation to truly complete
-      # before re-attempting the transfer.
-      CANCEL_RESP="$(aws route53domains --region us-east-1 \
+      # Three possible outcomes from the cancel call:
+      #   (A) Success        → got OperationId; poll it, then retry transfer
+      #   (B) Already cancelled → a prior run's cancel is still processing; skip to retry loop
+      #   (C) Other error    → give up on this domain
+      CANCEL_OPID=""
+      CANCEL_EC=0
+      CANCEL_OUT="$(aws route53domains --region us-east-1 \
         cancel-domain-transfer-to-another-aws-account \
-        --domain-name "$DOMAIN" --output json 2>"$ERR_TMP")" || {
+        --domain-name "$DOMAIN" --output json 2>"$ERR_TMP")" || CANCEL_EC=$?
+
+      if [[ $CANCEL_EC -eq 0 ]]; then
+        # (A) Parse OperationId and poll until the cancellation completes
+        if command -v jq >/dev/null 2>&1; then
+          CANCEL_OPID="$(echo "$CANCEL_OUT" | jq -r '.OperationId // empty' 2>/dev/null)" || CANCEL_OPID=""
+        else
+          CANCEL_OPID="$(echo "$CANCEL_OUT" | python3 -c \
+            'import json,sys; print(json.load(sys.stdin).get("OperationId",""))' 2>/dev/null)" || CANCEL_OPID=""
+        fi
+        if [[ -n "$CANCEL_OPID" ]]; then
+          echo "Cancel submitted (OperationId: $CANCEL_OPID). Polling for completion..."
+          MAX_WAIT=120; WAITED=0; POLL_INTERVAL=5; CANCEL_STATUS=""
+          while [[ $WAITED -lt $MAX_WAIT ]]; do
+            sleep $POLL_INTERVAL
+            WAITED=$((WAITED + POLL_INTERVAL))
+            OP_RESP="$(aws route53domains --region us-east-1 get-operation-detail \
+              --operation-id "$CANCEL_OPID" --output json 2>/dev/null)" || { CANCEL_STATUS="ERROR"; break; }
+            if command -v jq >/dev/null 2>&1; then
+              CANCEL_STATUS="$(echo "$OP_RESP" | jq -r '.Status // empty' 2>/dev/null)" || CANCEL_STATUS=""
+            else
+              CANCEL_STATUS="$(echo "$OP_RESP" | python3 -c \
+                'import json,sys; print(json.load(sys.stdin).get("Status",""))' 2>/dev/null)" || CANCEL_STATUS=""
+            fi
+            echo "  Cancel status: ${CANCEL_STATUS:-unknown} (${WAITED}s elapsed)"
+            [[ "$CANCEL_STATUS" == "SUCCESSFUL" || "$CANCEL_STATUS" == "FAILED" || "$CANCEL_STATUS" == "ERROR" ]] && break
+          done
+          [[ "$CANCEL_STATUS" != "SUCCESSFUL" ]] && \
+            echo "WARNING: Cancel ended with status '${CANCEL_STATUS:-unknown}'; retry may still fail."
+        else
+          echo "WARNING: Could not parse OperationId from cancel response; retrying transfer directly."
+        fi
+      elif grep -qi "already been cancelled" "$ERR_TMP" 2>/dev/null; then
+        # (B) A previous run already issued the cancel; it is still being processed asynchronously.
+        # Skip the cancel step and fall through to the transfer retry loop below.
+        echo "Transfer was already cancelled from a previous run; waiting for operation to clear..."
+      else
+        # (C) Unexpected error from the cancel call; give up on this domain
         echo "ERROR: Failed to cancel pending transfer for $DOMAIN:"
         cat "$ERR_TMP"
         ERR_ONE_LINE="$(tr '\n' ' ' <"$ERR_TMP" | sed 's/[[:space:]]\+/ /g' | cut -c1-240)"
         FAIL_ROWS+=("$DOMAIN"$'\t'"Cancel failed: $ERR_ONE_LINE")
         sleep 0.5
         continue
-      }
-
-      CANCEL_OPID=""
-      if command -v jq >/dev/null 2>&1; then
-        CANCEL_OPID="$(echo "$CANCEL_RESP" | jq -r '.OperationId // empty' 2>/dev/null)" || CANCEL_OPID=""
-      else
-        CANCEL_OPID="$(echo "$CANCEL_RESP" | python3 -c \
-          'import json,sys; print(json.load(sys.stdin).get("OperationId",""))' 2>/dev/null)" || CANCEL_OPID=""
       fi
 
-      if [[ -z "$CANCEL_OPID" ]]; then
-        echo "WARNING: Could not parse OperationId from cancel response; waiting 15s before retry."
-        sleep 15
-      else
-        echo "Cancel submitted (OperationId: $CANCEL_OPID). Polling for completion..."
-        MAX_WAIT=120
-        WAITED=0
-        POLL_INTERVAL=5
-        CANCEL_STATUS=""
-        while [[ $WAITED -lt $MAX_WAIT ]]; do
-          sleep $POLL_INTERVAL
-          WAITED=$((WAITED + POLL_INTERVAL))
-          OP_RESP="$(aws route53domains --region us-east-1 get-operation-detail \
-            --operation-id "$CANCEL_OPID" --output json 2>/dev/null)" || { CANCEL_STATUS="ERROR"; break; }
-          if command -v jq >/dev/null 2>&1; then
-            CANCEL_STATUS="$(echo "$OP_RESP" | jq -r '.Status // empty' 2>/dev/null)" || CANCEL_STATUS=""
-          else
-            CANCEL_STATUS="$(echo "$OP_RESP" | python3 -c \
-              'import json,sys; print(json.load(sys.stdin).get("Status",""))' 2>/dev/null)" || CANCEL_STATUS=""
-          fi
-          echo "  Cancel status: ${CANCEL_STATUS:-unknown} (${WAITED}s elapsed)"
-          [[ "$CANCEL_STATUS" == "SUCCESSFUL" || "$CANCEL_STATUS" == "FAILED" || "$CANCEL_STATUS" == "ERROR" ]] && break
-        done
-        if [[ "$CANCEL_STATUS" != "SUCCESSFUL" ]]; then
-          echo "WARNING: Cancel ended with status '${CANCEL_STATUS:-unknown}'; retry may still fail."
-        fi
-      fi
-
+      # Retry the transfer, polling if still blocked by a lingering async operation.
+      # This handles both case (A) where the cancel OperationId poll may have hit its
+      # timeout and case (B) where no OperationId was available to poll.
       echo "Retrying transfer for $DOMAIN..."
-      RESP="$(aws route53domains --region us-east-1 transfer-domain-to-another-aws-account \
-                --domain-name "$DOMAIN" \
-                --account-id "$TARGET_ACCOUNT_ID" \
-                --output json 2>"$ERR_TMP")" || {
+      MAX_WAIT=120; WAITED=0; POLL_INTERVAL=10; TRANSFER_OK=0
+      while [[ $WAITED -le $MAX_WAIT ]]; do
+        TRANSFER_EC=0
+        RESP="$(aws route53domains --region us-east-1 transfer-domain-to-another-aws-account \
+                  --domain-name "$DOMAIN" --account-id "$TARGET_ACCOUNT_ID" \
+                  --output json 2>"$ERR_TMP")" || TRANSFER_EC=$?
+        if [[ $TRANSFER_EC -eq 0 ]]; then
+          TRANSFER_OK=1; break
+        fi
+        grep -qi "operation in progress" "$ERR_TMP" 2>/dev/null || break  # non-retriable error
+        [[ $WAITED -ge $MAX_WAIT ]] && break
+        sleep $POLL_INTERVAL
+        WAITED=$((WAITED + POLL_INTERVAL))
+        echo "  Transfer still blocked, retrying... (${WAITED}s elapsed)"
+      done
+      if [[ $TRANSFER_OK -eq 0 ]]; then
         echo "ERROR initiating transfer for $DOMAIN (after cancel+retry):"
         cat "$ERR_TMP"
         ERR_ONE_LINE="$(tr '\n' ' ' <"$ERR_TMP" | sed 's/[[:space:]]\+/ /g' | cut -c1-240)"
         FAIL_ROWS+=("$DOMAIN"$'\t'"$ERR_ONE_LINE")
         sleep 0.5
         continue
-      }
+      fi
     else
       if grep -qi "operation in progress" "$ERR_TMP" 2>/dev/null; then
         echo "NOTE: A transfer is already in progress for $DOMAIN. Re-run with --cancel-pending to cancel and retry."
