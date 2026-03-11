@@ -232,7 +232,7 @@ echo
   echo "DryRun: $DRY_RUN"
   echo
   printf "DOMAIN\tPASSWORD\n"
-  printf "------\t--------\n"
+  printf -- "------\t--------\n"
   for row in "${SUCCESS_ROWS[@]}"; do
     printf "%s\n" "$row"
   done
@@ -240,7 +240,7 @@ echo
   if [[ ${#FAIL_ROWS[@]} -gt 0 ]]; then
     echo "Failures / Notes:"
     printf "DOMAIN\tERROR\n"
-    printf "------\t-----\n"
+    printf -- "------\t-----\n"
     for row in "${FAIL_ROWS[@]}"; do
       printf "%s\n" "$row"
     done
@@ -250,7 +250,7 @@ echo
   if [[ ${#DRY_RUN_ROWS[@]} -gt 0 ]]; then
     echo "Dry-run (no action taken):"
     printf "DOMAIN\tNOTE\n"
-    printf "------\t----\n"
+    printf -- "------\t----\n"
     for row in "${DRY_RUN_ROWS[@]}"; do
       printf "%s\n" "$row"
     done
