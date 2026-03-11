@@ -280,16 +280,23 @@ fi
 # point, after all early exits. This guarantees the file never exists as an empty orphan.
 (umask 077; : > "$TARGET_SCRIPT_FILE")
 
-# Issue 2: Use ASCII SOH ($'\x01') as the domain/password delimiter in the embedded array.
-# '|' can appear in Route 53-generated passwords and would corrupt the split; SOH cannot.
-SEP=$'\x01'
-EMBED_LINES=()
+# Build parallel arrays: domain names and base64-encoded passwords.
+# Base64 uses only printable ASCII (A-Z, a-z, 0-9, +, /, =), which is safe in double-quoted
+# bash strings and survives clipboard, CloudShell browser upload, and cloud sync unchanged.
+# This replaces the former SOH-delimiter approach: SOH (\x01) is a non-printable control
+# character silently stripped by many transfer paths, causing "Password is incorrect" errors.
+# Base64 also sidesteps incomplete escaping — no shell-special characters ($, `, !) can
+# appear in base64 output, so no per-character escaping of passwords is needed.
+EMBED_DOMAINS=()
+EMBED_PASSWORDS_B64=()
 for row in "${SUCCESS_ROWS[@]}"; do
   domain="${row%%$'\t'*}"
   pass="${row#*$'\t'}"
   domain_esc="${domain//\\/\\\\}"; domain_esc="${domain_esc//\"/\\\"}"
-  pass_esc="${pass//\\/\\\\}";   pass_esc="${pass_esc//\"/\\\"}"
-  EMBED_LINES+=("\"${domain_esc}${SEP}${pass_esc}\"")
+  # tr -d '\n' strips GNU base64 line-wrap newlines portably on both Linux and macOS.
+  pass_b64="$(printf '%s' "$pass" | base64 | tr -d '\n')"
+  EMBED_DOMAINS+=("\"${domain_esc}\"")
+  EMBED_PASSWORDS_B64+=("\"${pass_b64}\"")
 done
 
 # tee writes into the atomically-created 700-permission TARGET_SCRIPT_FILE, preserving its permissions.
@@ -316,19 +323,24 @@ done
   echo "  [[ \"\$ans\" =~ ^[Yy]$ ]] || exit 1"
   echo "fi"
   echo
-  echo "TRANSFERS=("
-  for l in "${EMBED_LINES[@]}"; do
-    echo "  $l"
+  echo "DOMAINS=("
+  for d in "${EMBED_DOMAINS[@]}"; do
+    echo "  $d"
+  done
+  echo ")"
+  echo
+  echo "PASSWORDS_B64=("
+  for p in "${EMBED_PASSWORDS_B64[@]}"; do
+    echo "  $p"
   done
   echo ")"
   echo
   echo "SUCCESS=0"
   echo "FAIL=0"
   echo
-  echo "for item in \"\${TRANSFERS[@]}\"; do"
-  # ${SEP} expands to the actual SOH byte here, embedding it as a literal pattern delimiter
-  echo "  DOMAIN=\"\${item%%${SEP}*}\""
-  echo "  PASSWORD=\"\${item#*${SEP}}\""
+  echo "for i in \"\${!DOMAINS[@]}\"; do"
+  echo "  DOMAIN=\"\${DOMAINS[\$i]}\""
+  echo "  PASSWORD=\"\$(printf '%s' \"\${PASSWORDS_B64[\$i]}\" | base64 -d)\""
   echo "  echo \"----\""
   echo "  echo \"Accepting transfer for: \$DOMAIN\""
   echo "  RESP=\"\$(aws route53domains --region us-east-1 accept-domain-transfer-from-another-aws-account \\"
