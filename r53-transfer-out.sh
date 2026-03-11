@@ -3,18 +3,23 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: r53-transfer-out.sh [--target-account=123456789012] [--dry-run] [--no-target-script]
+Usage: r53-transfer-out.sh [--target-account=123456789012] [--dry-run] [--no-target-script] [--cancel-pending]
 
 Options:
   --target-account=<account ID>  12-digit AWS account ID to transfer domains to (skips prompt if valid)
   --dry-run                      Show what would happen without initiating any transfers
   --no-target-script             Do not print/save the companion target-account accept script
+  --cancel-pending               If a domain already has a transfer in progress, cancel it and retry.
+                                 Default behaviour (without this flag) is to skip the domain and record
+                                 it as a failure. Use this flag to recover from a previous run where the
+                                 companion accept script failed (e.g. due to a corrupted password).
 USAGE
 }
 
 TARGET_ACCOUNT_ID=""
 DRY_RUN=0
 NO_TARGET_SCRIPT=0
+CANCEL_PENDING=0
 
 for arg in "$@"; do
   case "$arg" in
@@ -26,6 +31,9 @@ for arg in "$@"; do
       ;;
     --no-target-script)
       NO_TARGET_SCRIPT=1
+      ;;
+    --cancel-pending)
+      CANCEL_PENDING=1
       ;;
     -h|--help)
       usage
@@ -164,12 +172,34 @@ for DOMAIN in "${ALL_DOMAINS[@]}"; do
             --domain-name "$DOMAIN" \
             --account-id "$TARGET_ACCOUNT_ID" \
             --output json 2>"$ERR_TMP")" || {
-    echo "ERROR initiating transfer for $DOMAIN:"
-    cat "$ERR_TMP"
-    ERR_ONE_LINE="$(tr '\n' ' ' <"$ERR_TMP" | sed 's/[[:space:]]\+/ /g' | cut -c1-240)"
-    FAIL_ROWS+=("$DOMAIN"$'\t'"$ERR_ONE_LINE")
-    sleep 0.5
-    continue
+    # If a prior transfer is still pending, behaviour depends on --cancel-pending.
+    if grep -qi "operation in progress" "$ERR_TMP" 2>/dev/null && [[ $CANCEL_PENDING -eq 1 ]]; then
+      echo "Pending transfer detected for $DOMAIN; cancelling and retrying (--cancel-pending)..."
+      aws route53domains --region us-east-1 cancel-domain-transfer-to-another-aws-account \
+        --domain-name "$DOMAIN" >/dev/null 2>&1 || true
+      sleep 3
+      RESP="$(aws route53domains --region us-east-1 transfer-domain-to-another-aws-account \
+                --domain-name "$DOMAIN" \
+                --account-id "$TARGET_ACCOUNT_ID" \
+                --output json 2>"$ERR_TMP")" || {
+        echo "ERROR initiating transfer for $DOMAIN (after cancel+retry):"
+        cat "$ERR_TMP"
+        ERR_ONE_LINE="$(tr '\n' ' ' <"$ERR_TMP" | sed 's/[[:space:]]\+/ /g' | cut -c1-240)"
+        FAIL_ROWS+=("$DOMAIN"$'\t'"$ERR_ONE_LINE")
+        sleep 0.5
+        continue
+      }
+    else
+      if grep -qi "operation in progress" "$ERR_TMP" 2>/dev/null; then
+        echo "NOTE: A transfer is already in progress for $DOMAIN. Re-run with --cancel-pending to cancel and retry."
+      fi
+      echo "ERROR initiating transfer for $DOMAIN:"
+      cat "$ERR_TMP"
+      ERR_ONE_LINE="$(tr '\n' ' ' <"$ERR_TMP" | sed 's/[[:space:]]\+/ /g' | cut -c1-240)"
+      FAIL_ROWS+=("$DOMAIN"$'\t'"$ERR_ONE_LINE")
+      sleep 0.5
+      continue
+    fi
   }
 
   # Issues 5+6: Parse Password/OperationId with piped one-liners and explicit fallback guards.
