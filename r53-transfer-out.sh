@@ -3,16 +3,20 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: r53-transfer-out.sh [--target-account=123456789012] [--dry-run] [--no-target-script] [--cancel-pending]
+Usage: r53-transfer-out.sh [--target-account=123456789012] [--dry-run] [--no-target-script] [--cancel-pending] [--select-domains[=d1.com,d2.com]]
 
 Options:
-  --target-account=<account ID>  12-digit AWS account ID to transfer domains to (skips prompt if valid)
-  --dry-run                      Show what would happen without initiating any transfers
-  --no-target-script             Do not print/save the companion target-account accept script
-  --cancel-pending               If a domain already has a transfer in progress, cancel it and retry.
-                                 Default behaviour (without this flag) is to skip the domain and record
-                                 it as a failure. Use this flag to recover from a previous run where the
-                                 companion accept script failed (e.g. due to a corrupted password).
+  --target-account=<account ID>      12-digit AWS account ID to transfer domains to (skips prompt if valid)
+  --dry-run                          Show what would happen without initiating any transfers
+  --no-target-script                 Do not print/save the companion target-account accept script
+  --cancel-pending                   If a domain already has a transfer in progress, cancel it and retry.
+                                     Default behaviour (without this flag) is to skip the domain and record
+                                     it as a failure. Use this flag to recover from a previous run where the
+                                     companion accept script failed (e.g. due to a corrupted password).
+  --select-domains[=d1.com,d2.com]   Restrict the transfer to specific domains only.
+                                     Without a value: prompts [Y/n] interactively for each domain found.
+                                     With a comma-separated list: only those domains are processed; any
+                                     specified domain not found in the account produces a warning.
 USAGE
 }
 
@@ -20,6 +24,8 @@ TARGET_ACCOUNT_ID=""
 DRY_RUN=0
 NO_TARGET_SCRIPT=0
 CANCEL_PENDING=0
+SELECT_DOMAINS=()
+INTERACTIVE_SELECT=0
 
 for arg in "$@"; do
   case "$arg" in
@@ -34,6 +40,27 @@ for arg in "$@"; do
       ;;
     --cancel-pending)
       CANCEL_PENDING=1
+      ;;
+    --select-domains)
+      if [[ ${#SELECT_DOMAINS[@]} -gt 0 ]]; then
+        echo "ERROR: --select-domains with a domain list and --select-domains (interactive) cannot be combined."
+        exit 1
+      fi
+      INTERACTIVE_SELECT=1
+      ;;
+    --select-domains=*)
+      if [[ $INTERACTIVE_SELECT -eq 1 ]]; then
+        echo "ERROR: --select-domains with a domain list and --select-domains (interactive) cannot be combined."
+        exit 1
+      fi
+      val="${arg#*=}"
+      if [[ -z "$val" ]]; then
+        INTERACTIVE_SELECT=1
+      else
+        IFS=',' read -ra _SD_PARSED <<< "$val"
+        SELECT_DOMAINS+=("${_SD_PARSED[@]}")
+        unset _SD_PARSED
+      fi
       ;;
     -h|--help)
       usage
@@ -138,6 +165,48 @@ fi
 
 echo "Found ${#ALL_DOMAINS[@]} domain(s)."
 echo
+
+# Filter domains when --select-domains is provided.
+if [[ ${#SELECT_DOMAINS[@]} -gt 0 ]]; then
+  FILTERED=()
+  declare -A _SEEN_SD=()
+  for sd in "${SELECT_DOMAINS[@]}"; do
+    sd="$(echo "$sd" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"; [[ -z "$sd" ]] && continue
+    if [[ -n "${_SEEN_SD[$sd]+x}" ]]; then
+      echo "WARNING: '$sd' specified more than once in --select-domains; ignoring duplicate."
+      continue
+    fi
+    _SEEN_SD[$sd]=1
+    found=0
+    for d in "${ALL_DOMAINS[@]}"; do
+      d_lower="$(echo "$d" | tr '[:upper:]' '[:lower:]')"
+      [[ "$d_lower" == "$sd" ]] && { FILTERED+=("$d"); found=1; break; }
+    done
+    [[ $found -eq 0 ]] && echo "WARNING: '$sd' not found in account; skipping."
+  done
+  unset _SEEN_SD
+  ALL_DOMAINS=("${FILTERED[@]}")
+  echo "Selected ${#ALL_DOMAINS[@]} domain(s) from --select-domains list."
+  echo
+elif [[ $INTERACTIVE_SELECT -eq 1 ]]; then
+  echo "Interactive domain selection (--select-domains):"
+  FILTERED=()
+  for d in "${ALL_DOMAINS[@]}"; do
+    [[ -z "$d" ]] && continue
+    read -r -p "  Include '$d' in transfer? [Y/n]: " ans
+    ans="${ans:-Y}"
+    [[ "$ans" =~ ^[Yy]$ ]] && FILTERED+=("$d")
+  done
+  ALL_DOMAINS=("${FILTERED[@]}")
+  echo
+  echo "Selected ${#ALL_DOMAINS[@]} domain(s)."
+  echo
+fi
+
+if [[ ${#ALL_DOMAINS[@]} -eq 0 ]]; then
+  echo "No domains selected for transfer."
+  exit 0
+fi
 
 SUCCESS_ROWS=()    # "domain<TAB>password"
 FAIL_ROWS=()       # "domain<TAB>error"
