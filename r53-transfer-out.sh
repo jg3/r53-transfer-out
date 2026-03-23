@@ -3,16 +3,21 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: r53-transfer-out.sh [--target-account=123456789012] [--dry-run] [--no-target-script] [--cancel-pending]
+Usage: r53-transfer-out.sh [--target-account=123456789012] [--dry-run] [--no-target-script] [--cancel-pending] [--no-dns-export] [--select-domains[=d1.com,d2.com]]
 
 Options:
-  --target-account=<account ID>  12-digit AWS account ID to transfer domains to (skips prompt if valid)
-  --dry-run                      Show what would happen without initiating any transfers
-  --no-target-script             Do not print/save the companion target-account accept script
-  --cancel-pending               If a domain already has a transfer in progress, cancel it and retry.
-                                 Default behaviour (without this flag) is to skip the domain and record
-                                 it as a failure. Use this flag to recover from a previous run where the
-                                 companion accept script failed (e.g. due to a corrupted password).
+  --target-account=<account ID>      12-digit AWS account ID to transfer domains to (skips prompt if valid)
+  --dry-run                          Show what would happen without initiating any transfers
+  --no-target-script                 Do not print/save the companion target-account accept script
+  --cancel-pending                   If a domain already has a transfer in progress, cancel it and retry.
+                                     Default behaviour (without this flag) is to skip the domain and record
+                                     it as a failure. Use this flag to recover from a previous run where the
+                                     companion accept script failed (e.g. due to a corrupted password).
+  --no-dns-export                    Skip exporting hosted zone DNS records (companion script will not restore DNS)
+  --select-domains[=d1.com,d2.com]   Restrict the transfer to specific domains only.
+                                     Without a value: prompts [Y/n] interactively for each domain found.
+                                     With a comma-separated list: only those domains are processed; any
+                                     specified domain not found in the account produces a warning.
 USAGE
 }
 
@@ -20,6 +25,9 @@ TARGET_ACCOUNT_ID=""
 DRY_RUN=0
 NO_TARGET_SCRIPT=0
 CANCEL_PENDING=0
+NO_DNS_EXPORT=0
+SELECT_DOMAINS=()
+INTERACTIVE_SELECT=0
 
 for arg in "$@"; do
   case "$arg" in
@@ -34,6 +42,30 @@ for arg in "$@"; do
       ;;
     --cancel-pending)
       CANCEL_PENDING=1
+      ;;
+    --no-dns-export)
+      NO_DNS_EXPORT=1
+      ;;
+    --select-domains)
+      if [[ ${#SELECT_DOMAINS[@]} -gt 0 ]]; then
+        echo "ERROR: --select-domains with a domain list and --select-domains (interactive) cannot be combined."
+        exit 1
+      fi
+      INTERACTIVE_SELECT=1
+      ;;
+    --select-domains=*)
+      if [[ $INTERACTIVE_SELECT -eq 1 ]]; then
+        echo "ERROR: --select-domains with a domain list and --select-domains (interactive) cannot be combined."
+        exit 1
+      fi
+      val="${arg#*=}"
+      if [[ -z "$val" ]]; then
+        INTERACTIVE_SELECT=1
+      else
+        IFS=',' read -ra _SD_PARSED <<< "$val"
+        SELECT_DOMAINS+=("${_SD_PARSED[@]}")
+        unset _SD_PARSED
+      fi
       ;;
     -h|--help)
       usage
@@ -82,6 +114,7 @@ echo "Source AWS Account (caller identity): ${SOURCE_ACCT:-<unknown>}"
 echo "Target AWS Account: $TARGET_ACCOUNT_ID"
 echo "AWS CLI region: ${REGION} (informational only; Route 53 Domains is a global service)"
 echo "Dry-run: $([[ $DRY_RUN -eq 1 ]] && echo yes || echo no)"
+echo "DNS export: $([[ $NO_DNS_EXPORT -eq 1 ]] && echo no || echo yes)"
 echo
 
 # Pre-create OUTFILE atomically with restricted permissions (no TOCTOU window).
@@ -139,7 +172,49 @@ fi
 echo "Found ${#ALL_DOMAINS[@]} domain(s)."
 echo
 
-SUCCESS_ROWS=()    # "domain<TAB>password"
+# Filter domains when --select-domains is provided.
+if [[ ${#SELECT_DOMAINS[@]} -gt 0 ]]; then
+  FILTERED=()
+  declare -A _SEEN_SD=()
+  for sd in "${SELECT_DOMAINS[@]}"; do
+    sd="$(echo "$sd" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"; [[ -z "$sd" ]] && continue
+    if [[ -n "${_SEEN_SD[$sd]+x}" ]]; then
+      echo "WARNING: '$sd' specified more than once in --select-domains; ignoring duplicate."
+      continue
+    fi
+    _SEEN_SD[$sd]=1
+    found=0
+    for d in "${ALL_DOMAINS[@]}"; do
+      d_lower="$(echo "$d" | tr '[:upper:]' '[:lower:]')"
+      [[ "$d_lower" == "$sd" ]] && { FILTERED+=("$d"); found=1; break; }
+    done
+    [[ $found -eq 0 ]] && echo "WARNING: '$sd' not found in account; skipping."
+  done
+  unset _SEEN_SD
+  ALL_DOMAINS=("${FILTERED[@]}")
+  echo "Selected ${#ALL_DOMAINS[@]} domain(s) from --select-domains list."
+  echo
+elif [[ $INTERACTIVE_SELECT -eq 1 ]]; then
+  echo "Interactive domain selection (--select-domains):"
+  FILTERED=()
+  for d in "${ALL_DOMAINS[@]}"; do
+    [[ -z "$d" ]] && continue
+    read -r -p "  Include '$d' in transfer? [Y/n]: " ans
+    ans="${ans:-Y}"
+    [[ "$ans" =~ ^[Yy]$ ]] && FILTERED+=("$d")
+  done
+  ALL_DOMAINS=("${FILTERED[@]}")
+  echo
+  echo "Selected ${#ALL_DOMAINS[@]} domain(s)."
+  echo
+fi
+
+if [[ ${#ALL_DOMAINS[@]} -eq 0 ]]; then
+  echo "No domains selected for transfer."
+  exit 0
+fi
+
+SUCCESS_ROWS=()    # "domain<TAB>password<TAB>opid"
 FAIL_ROWS=()       # "domain<TAB>error"
 DRY_RUN_ROWS=()    # "domain<TAB>DRY-RUN note" (issue 9)
 
@@ -306,7 +381,7 @@ except Exception:
 
   echo "OperationId: ${OPID:-<none>}"
   echo "Password:    $PASSWORD"
-  SUCCESS_ROWS+=("$DOMAIN"$'\t'"$PASSWORD")
+  SUCCESS_ROWS+=("$DOMAIN"$'\t'"$PASSWORD"$'\t'"${OPID}")
   sleep 0.5
 done
 
@@ -328,9 +403,10 @@ echo
   echo "SourceAccountId: ${SOURCE_ACCT:-unknown}"
   echo "TargetAccountId: $TARGET_ACCOUNT_ID"
   echo "DryRun: $DRY_RUN"
+  echo "DNSExport: $([[ $NO_DNS_EXPORT -eq 1 ]] && echo disabled || echo enabled)"
   echo
-  printf "DOMAIN\tPASSWORD\n"
-  printf -- "------\t--------\n"
+  printf "DOMAIN\tPASSWORD\tOPERATION_ID\n"
+  printf -- "------\t--------\t------------\n"
   for row in "${SUCCESS_ROWS[@]}"; do
     printf "%s\n" "$row"
   done
@@ -374,46 +450,212 @@ if [[ ${#SUCCESS_ROWS[@]} -eq 0 ]]; then
   exit $FINAL_EXIT
 fi
 
+# ---------------------------------------------------------------------------
+# DNS record export — for each successfully transferred domain, find its
+# public hosted zone in Route 53 and capture all records except the apex NS
+# and SOA (which Route 53 auto-generates for the new zone in the target account).
+# ---------------------------------------------------------------------------
+EMBED_DNS_RECORDS_B64=()   # parallel to EMBED_DOMAINS / EMBED_PASSWORDS_B64
+
+if [[ $NO_DNS_EXPORT -eq 0 ]]; then
+  echo
+  echo "Exporting DNS records from source hosted zones..."
+  DNS_ERR="$(mktemp)"; TMPFILES+=("$DNS_ERR")
+
+  for row in "${SUCCESS_ROWS[@]}"; do
+    DOMAIN="${row%%$'\t'*}"
+
+    echo "  DNS export: $DOMAIN"
+
+    # Find the public hosted zone ID for this domain name.
+    # list-hosted-zones-by-name returns zones whose name >= the given name;
+    # we pick the first one whose name matches exactly (trailing dot form).
+    ZONE_RESP="$(aws route53 list-hosted-zones-by-name \
+                   --dns-name "$DOMAIN" \
+                   --max-items 10 \
+                   --output json 2>"$DNS_ERR")" || {
+      echo "  WARNING: Could not list hosted zones for $DOMAIN (skipping DNS export):"
+      cat "$DNS_ERR"
+      EMBED_DNS_RECORDS_B64+=('""')
+      continue
+    }
+
+    ZONE_ID="$(echo "$ZONE_RESP" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+domain_dot = sys.argv[1] + '.'
+for z in data.get('HostedZones', []):
+    if z['Name'] == domain_dot and not z['Config']['PrivateZone']:
+        # Strip /hostedzone/ prefix
+        print(z['Id'].split('/')[-1])
+        break
+" "$DOMAIN" 2>/dev/null)" || ZONE_ID=""
+
+    if [[ -z "$ZONE_ID" ]]; then
+      echo "  WARNING: No public hosted zone found for $DOMAIN — DNS records will not be migrated."
+      EMBED_DNS_RECORDS_B64+=('""')
+      continue
+    fi
+
+    echo "    Found zone: $ZONE_ID"
+
+    # Paginate list-resource-record-sets to collect all records.
+    ALL_RECORDS_JSON="[]"
+    RR_NEXT_NAME=""
+    RR_NEXT_TYPE=""
+    while true; do
+      # AWS CLI pagination for list-resource-record-sets uses --start-record-name /
+      # --start-record-type, not --starting-token.
+      if [[ -n "$RR_NEXT_NAME" ]]; then
+        RR_CMD=(aws route53 list-resource-record-sets
+                 --hosted-zone-id "$ZONE_ID"
+                 --max-items 300
+                 --start-record-name "$RR_NEXT_NAME"
+                 --start-record-type "$RR_NEXT_TYPE"
+                 --output json)
+      else
+        RR_CMD=(aws route53 list-resource-record-sets
+                 --hosted-zone-id "$ZONE_ID"
+                 --max-items 300
+                 --output json)
+      fi
+
+      RR_PAGE="$("${RR_CMD[@]}" 2>"$DNS_ERR")" || {
+        echo "  WARNING: Failed to list records for $DOMAIN (zone $ZONE_ID); partial or no data:"
+        cat "$DNS_ERR"
+        break
+      }
+
+      # Merge this page into ALL_RECORDS_JSON and check for more pages.
+      MERGE_RESULT="$(echo "$RR_PAGE" | python3 -c "
+import json, sys
+page = json.load(sys.stdin)
+existing = json.loads(sys.argv[1])
+existing.extend(page.get('ResourceRecordSets', []))
+print(json.dumps(existing))
+# Pagination tokens
+is_trunc = page.get('IsTruncated', False)
+next_name = page.get('NextRecordName', '')
+next_type = page.get('NextRecordType', '')
+print(str(is_trunc))
+print(next_name)
+print(next_type)
+" "$ALL_RECORDS_JSON" 2>/dev/null)"
+
+      ALL_RECORDS_JSON="$(echo "$MERGE_RESULT" | head -1)"
+      IS_TRUNC="$(echo "$MERGE_RESULT" | sed -n '2p')"
+      RR_NEXT_NAME="$(echo "$MERGE_RESULT" | sed -n '3p')"
+      RR_NEXT_TYPE="$(echo "$MERGE_RESULT" | sed -n '4p')"
+
+      [[ "$IS_TRUNC" != "True" ]] && break
+    done
+
+    # Filter out apex NS and SOA records; warn about alias records pointing to
+    # AWS-managed resources that will need to be recreated in the target account.
+    FILTERED_JSON="$(echo "$ALL_RECORDS_JSON" | python3 -c "
+import json, sys
+records = json.load(sys.stdin)
+domain_dot = sys.argv[1] + '.'
+kept = []
+alias_warnings = []
+for r in records:
+    rtype = r.get('Type', '')
+    rname = r.get('Name', '')
+    # Exclude apex NS and SOA — Route 53 auto-generates these for the new zone.
+    if rname == domain_dot and rtype in ('NS', 'SOA'):
+        continue
+    # Warn about alias records; they may reference resources in the source account.
+    if 'AliasTarget' in r:
+        alias_warnings.append(rname + ' ' + rtype + ' -> ' + r['AliasTarget'].get('DNSName','?'))
+    kept.append(r)
+if alias_warnings:
+    print('ALIAS_WARNINGS:' + '|'.join(alias_warnings), file=sys.stderr)
+print(json.dumps(kept))
+" "$DOMAIN" 2>"$DNS_ERR")" || FILTERED_JSON="[]"
+
+    if [[ -s "$DNS_ERR" ]]; then
+      while IFS= read -r warn_line; do
+        if [[ "$warn_line" == ALIAS_WARNINGS:* ]]; then
+          IFS='|' read -ra ALIASES <<< "${warn_line#ALIAS_WARNINGS:}"
+          for alias_entry in "${ALIASES[@]}"; do
+            echo "  WARNING: Alias record in $DOMAIN points to AWS resource — verify it exists in target account: $alias_entry"
+          done
+        else
+          echo "  WARNING (DNS filter): $warn_line"
+        fi
+      done < "$DNS_ERR"
+    fi
+
+    RECORD_COUNT="$(echo "$FILTERED_JSON" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null)" || RECORD_COUNT="?"
+    echo "    Exporting $RECORD_COUNT record(s) (apex NS and SOA excluded)."
+
+    # Base64-encode the filtered JSON for safe embedding in the companion script.
+    RECORDS_B64="$(echo "$FILTERED_JSON" | base64 | tr -d '\n')"
+    EMBED_DNS_RECORDS_B64+=("\"${RECORDS_B64}\"")
+  done
+else
+  # No DNS export requested; populate with empty placeholders so the parallel
+  # array stays aligned with EMBED_DOMAINS / EMBED_PASSWORDS_B64.
+  for row in "${SUCCESS_ROWS[@]}"; do
+    EMBED_DNS_RECORDS_B64+=('""')
+  done
+  echo "DNS export skipped (--no-dns-export)."
+fi
+
 # Create the companion script file atomically with restricted permissions only at this
 # point, after all early exits. This guarantees the file never exists as an empty orphan.
 (umask 077; : > "$TARGET_SCRIPT_FILE")
 
-# Build parallel arrays: domain names and base64-encoded passwords.
+# Build parallel arrays: domain names, base64-encoded passwords, operation IDs,
+# and base64-encoded DNS record JSON.
 # Base64 uses only printable ASCII (A-Z, a-z, 0-9, +, /, =), which is safe in double-quoted
 # bash strings and survives clipboard, CloudShell browser upload, and cloud sync unchanged.
-# This replaces the former SOH-delimiter approach: SOH (\x01) is a non-printable control
-# character silently stripped by many transfer paths, causing "Password is incorrect" errors.
-# Base64 also sidesteps incomplete escaping — no shell-special characters ($, `, !) can
-# appear in base64 output, so no per-character escaping of passwords is needed.
 EMBED_DOMAINS=()
 EMBED_PASSWORDS_B64=()
+EMBED_OPIDS=()
+IDX=0
 for row in "${SUCCESS_ROWS[@]}"; do
   domain="${row%%$'\t'*}"
-  pass="${row#*$'\t'}"
+  rest="${row#*$'\t'}"
+  pass="${rest%%$'\t'*}"
+  opid="${rest#*$'\t'}"
   domain_esc="${domain//\\/\\\\}"; domain_esc="${domain_esc//\"/\\\"}"
-  # tr -d '\n' strips GNU base64 line-wrap newlines portably on both Linux and macOS.
+  opid_esc="${opid//\\/\\\\}";     opid_esc="${opid_esc//\"/\\\"}"
   pass_b64="$(printf '%s' "$pass" | base64 | tr -d '\n')"
   EMBED_DOMAINS+=("\"${domain_esc}\"")
   EMBED_PASSWORDS_B64+=("\"${pass_b64}\"")
+  EMBED_OPIDS+=("\"${opid_esc}\"")
+  IDX=$((IDX+1))
 done
 
 # tee writes into the atomically-created 700-permission TARGET_SCRIPT_FILE, preserving its permissions.
 {
-  echo "#!/usr/bin/env bash"
-  echo "set -euo pipefail"
-  echo
-  echo "# Companion script generated by r53-transfer-out.sh"
-  echo "# Purpose: run in the TARGET AWS account CloudShell to accept Route 53 domain transfers."
+  cat <<'HEADER'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Companion script generated by r53-transfer-out.sh
+# Purpose: run in the TARGET AWS account CloudShell to accept Route 53 domain
+#          transfers, create hosted zones, restore DNS records, and update
+#          the registered domain nameservers.
+#
+# IMPORTANT: This script contains transfer passwords. Handle securely.
+HEADER
+
   echo "# SourceAccountId: ${SOURCE_ACCT:-unknown}"
   echo "# TargetAccountId: $TARGET_ACCOUNT_ID"
   echo "# Generated: $TS"
-  echo "#"
-  echo "# IMPORTANT: This script contains transfer passwords. Handle securely."
+  echo "# DNSExport: $([[ $NO_DNS_EXPORT -eq 1 ]] && echo disabled || echo enabled)"
   echo
-  echo "command -v aws >/dev/null 2>&1 || { echo \"ERROR: aws CLI not found.\"; exit 1; }"
-  echo
-  echo "CALLER_ACCT=\"\$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)\""
-  echo "echo \"Running in AWS Account: \${CALLER_ACCT:-<unknown>}\""
+
+  cat <<'FUNCS'
+command -v aws     >/dev/null 2>&1 || { echo "ERROR: aws CLI not found."; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 not found."; exit 1; }
+
+CALLER_ACCT="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)"
+echo "Running in AWS Account: ${CALLER_ACCT:-<unknown>}"
+FUNCS
+
   echo "echo \"Expected TARGET account: $TARGET_ACCOUNT_ID\""
   echo "if [[ -n \"\$CALLER_ACCT\" && \"\$CALLER_ACCT\" != \"$TARGET_ACCOUNT_ID\" ]]; then"
   echo "  echo \"WARNING: You are not in the expected target account. Continue? (y/N)\""
@@ -421,42 +663,312 @@ done
   echo "  [[ \"\$ans\" =~ ^[Yy]$ ]] || exit 1"
   echo "fi"
   echo
+
   echo "DOMAINS=("
   for d in "${EMBED_DOMAINS[@]}"; do
     echo "  $d"
   done
   echo ")"
   echo
+
   echo "PASSWORDS_B64=("
   for p in "${EMBED_PASSWORDS_B64[@]}"; do
     echo "  $p"
   done
   echo ")"
   echo
-  echo "SUCCESS=0"
-  echo "FAIL=0"
+
+  echo "OPIDS=("
+  for o in "${EMBED_OPIDS[@]}"; do
+    echo "  $o"
+  done
+  echo ")"
   echo
-  echo "for i in \"\${!DOMAINS[@]}\"; do"
-  echo "  DOMAIN=\"\${DOMAINS[\$i]}\""
-  echo "  PASSWORD=\"\$(printf '%s' \"\${PASSWORDS_B64[\$i]}\" | base64 -d)\""
-  echo "  echo \"----\""
-  echo "  echo \"Accepting transfer for: \$DOMAIN\""
-  echo "  RESP=\"\$(aws route53domains --region us-east-1 accept-domain-transfer-from-another-aws-account \\"
-  echo "            --domain-name \"\$DOMAIN\" \\"
-  echo "            --password \"\$PASSWORD\" \\"
-  echo "            --output json 2>&1)\" || {"
-  echo "    echo \"ERROR accepting transfer for \$DOMAIN:\""
-  echo "    echo \"\$RESP\""
-  echo "    FAIL=\$((FAIL+1))"
-  echo "    continue"
-  echo "  }"
-  echo "  echo \"Accepted. Response:\""
-  echo "  echo \"\$RESP\""
-  echo "  SUCCESS=\$((SUCCESS+1))"
-  echo "done"
+
+  echo "DNS_RECORDS_B64=("
+  for dr in "${EMBED_DNS_RECORDS_B64[@]}"; do
+    echo "  $dr"
+  done
+  echo ")"
   echo
-  echo "echo"
-  echo "echo \"Done. Accepted: \$SUCCESS  Failed: \$FAIL\""
+
+  # -------------------------------------------------------------------------
+  # Phase 1: accept transfers, create hosted zones, import DNS records
+  # -------------------------------------------------------------------------
+  cat <<'PHASE1_START'
+SUCCESS=0
+FAIL=0
+
+# NEW_ZONE_IDS and NEW_ZONE_NS are populated during Phase 1 and consumed in Phase 2.
+NEW_ZONE_IDS=()   # hosted zone ID (without /hostedzone/ prefix) for each domain
+NEW_ZONE_NS=()    # space-separated NS values for each domain
+
+for i in "${!DOMAINS[@]}"; do
+  DOMAIN="${DOMAINS[$i]}"
+  PASSWORD="$(printf '%s' "${PASSWORDS_B64[$i]}" | base64 -d)"
+  echo "----"
+  echo "Domain: $DOMAIN"
+
+  # ------------------------------------------------------------------
+  # Step 1: Accept the domain transfer from the source account.
+  # ------------------------------------------------------------------
+  echo "  [1/3] Accepting domain transfer..."
+  ACCEPT_RESP="$(aws route53domains --region us-east-1 \
+    accept-domain-transfer-from-another-aws-account \
+    --domain-name "$DOMAIN" \
+    --password "$PASSWORD" \
+    --output json 2>&1)" || {
+    echo "  ERROR accepting transfer for $DOMAIN:"
+    echo "  $ACCEPT_RESP"
+    FAIL=$((FAIL+1))
+    NEW_ZONE_IDS+=("")
+    NEW_ZONE_NS+=("")
+    continue
+  }
+  echo "  Accepted. Response: $ACCEPT_RESP"
+
+  # ------------------------------------------------------------------
+  # Step 2: Create a new hosted zone in this (target) account.
+  # The zone gets brand-new NS records assigned by Route 53.
+  # ------------------------------------------------------------------
+  echo "  [2/3] Creating hosted zone..."
+  CALLER_REF="transfer-${DOMAIN}-$(date +%s)"
+  CREATE_RESP="$(aws route53 create-hosted-zone \
+    --name "$DOMAIN" \
+    --caller-reference "$CALLER_REF" \
+    --output json 2>&1)" || {
+    echo "  ERROR creating hosted zone for $DOMAIN:"
+    echo "  $CREATE_RESP"
+    FAIL=$((FAIL+1))
+    NEW_ZONE_IDS+=("")
+    NEW_ZONE_NS+=("")
+    continue
+  }
+
+  NEW_ZONE_FULL_ID="$(echo "$CREATE_RESP" | python3 -c \
+    "import json,sys; print(json.load(sys.stdin)['HostedZone']['Id'])" 2>/dev/null)" || NEW_ZONE_FULL_ID=""
+  NEW_ZONE_ID="${NEW_ZONE_FULL_ID##*/hostedzone/}"
+  NEW_ZONE_ID="${NEW_ZONE_ID##*/}"   # strip /hostedzone/ prefix robustly
+
+  if [[ -z "$NEW_ZONE_ID" ]]; then
+    echo "  ERROR: Could not parse new hosted zone ID from response."
+    echo "  $CREATE_RESP"
+    FAIL=$((FAIL+1))
+    NEW_ZONE_IDS+=("")
+    NEW_ZONE_NS+=("")
+    continue
+  fi
+
+  echo "  New hosted zone ID: $NEW_ZONE_ID"
+
+  # Retrieve the NS records Route 53 assigned to the new zone.
+  NS_RESP="$(aws route53 list-resource-record-sets \
+    --hosted-zone-id "$NEW_ZONE_ID" \
+    --query "ResourceRecordSets[?Type=='NS'].ResourceRecords[].Value" \
+    --output text 2>/dev/null)" || NS_RESP=""
+
+  NEW_ZONE_IDS+=("$NEW_ZONE_ID")
+  NEW_ZONE_NS+=("$NS_RESP")
+
+  echo "  New zone nameservers: $NS_RESP"
+
+  # ------------------------------------------------------------------
+  # Step 3: Restore DNS records exported from the source account.
+  # ------------------------------------------------------------------
+  DNS_B64="${DNS_RECORDS_B64[$i]}"
+  if [[ -z "$DNS_B64" ]]; then
+    echo "  [3/3] No DNS records to restore (export was skipped or zone not found in source)."
+    SUCCESS=$((SUCCESS+1))
+    continue
+  fi
+
+  echo "  [3/3] Restoring DNS records..."
+  DNS_JSON="$(printf '%s' "$DNS_B64" | base64 -d 2>/dev/null)" || DNS_JSON="[]"
+
+  RECORD_COUNT="$(echo "$DNS_JSON" | python3 -c \
+    "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null)" || RECORD_COUNT=0
+
+  if [[ "$RECORD_COUNT" -eq 0 ]]; then
+    echo "  No records to restore."
+    SUCCESS=$((SUCCESS+1))
+    continue
+  fi
+
+  echo "  Restoring $RECORD_COUNT record(s) in batches of 500..."
+
+  # python3 builds and applies batches of up to 500 CREATE changes.
+  python3 - "$DNS_JSON" "$NEW_ZONE_ID" <<'PYEOF'
+import json, sys, subprocess, math
+
+records = json.loads(sys.argv[1])
+zone_id = sys.argv[2]
+batch_size = 500
+
+def apply_batch(changes, zone_id):
+    change_batch = {"Comment": "Restored by r53-transfer-out companion script", "Changes": changes}
+    result = subprocess.run(
+        ["aws", "route53", "change-resource-record-sets",
+         "--hosted-zone-id", zone_id,
+         "--change-batch", json.dumps(change_batch),
+         "--output", "json"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"  ERROR applying batch: {result.stderr.strip()}", file=sys.stderr)
+        return False
+    resp = json.loads(result.stdout)
+    status = resp.get("ChangeInfo", {}).get("Status", "?")
+    change_id = resp.get("ChangeInfo", {}).get("Id", "?")
+    print(f"  Batch applied — ChangeId: {change_id}  Status: {status}")
+    return True
+
+total_batches = math.ceil(len(records) / batch_size)
+failed_batches = 0
+for batch_num in range(total_batches):
+    chunk = records[batch_num * batch_size : (batch_num + 1) * batch_size]
+    changes = [{"Action": "CREATE", "ResourceRecordSet": r} for r in chunk]
+    print(f"  Applying batch {batch_num + 1}/{total_batches} ({len(changes)} records)...")
+    if not apply_batch(changes, zone_id):
+        failed_batches += 1
+
+if failed_batches:
+    print(f"  WARNING: {failed_batches} batch(es) failed. Some records may be missing.")
+    sys.exit(1)
+else:
+    print(f"  All {len(records)} record(s) restored successfully.")
+PYEOF
+  # Capture python3 exit status without aborting the script (set -e).
+  PY_STATUS=$?
+  if [[ $PY_STATUS -ne 0 ]]; then
+    echo "  WARNING: DNS record restore encountered errors for $DOMAIN."
+    FAIL=$((FAIL+1))
+  else
+    SUCCESS=$((SUCCESS+1))
+  fi
+
+done
+
+PHASE1_START
+
+  # -------------------------------------------------------------------------
+  # Phase 2: poll for domain transfer completion, then update nameservers
+  # -------------------------------------------------------------------------
+  cat <<'PHASE2'
+
+echo
+echo "==================== Phase 2: Updating domain nameservers ===================="
+echo "Polling for domain transfer operations to complete (timeout: 30 min per domain)..."
+echo "Note: transfers can take several minutes. The script will wait and retry."
+echo
+
+NS_SUCCESS=0
+NS_FAIL=0
+
+for i in "${!DOMAINS[@]}"; do
+  DOMAIN="${DOMAINS[$i]}"
+  OPID="${OPIDS[$i]}"
+  ZONE_ID="${NEW_ZONE_IDS[$i]:-}"
+  ZONE_NS="${NEW_ZONE_NS[$i]:-}"
+
+  echo "----"
+  echo "Domain: $DOMAIN"
+
+  if [[ -z "$ZONE_ID" ]]; then
+    echo "  Skipping nameserver update — no hosted zone was created for this domain."
+    NS_FAIL=$((NS_FAIL+1))
+    continue
+  fi
+
+  if [[ -z "$OPID" ]]; then
+    echo "  WARNING: No OperationId recorded for this domain — skipping transfer poll."
+    echo "  Attempting nameserver update directly..."
+  else
+    # Poll operation status until SUCCESSFUL, FAILED, or timeout (30 min).
+    TIMEOUT_SECS=1800
+    SLEEP_SECS=30
+    ELAPSED=0
+    OP_STATUS="UNKNOWN"
+    echo "  Polling transfer OperationId: $OPID"
+    while [[ $ELAPSED -lt $TIMEOUT_SECS ]]; do
+      OP_RESP="$(aws route53domains --region us-east-1 get-operation-detail \
+        --operation-id "$OPID" --output json 2>/dev/null)" || OP_RESP="{}"
+      OP_STATUS="$(echo "$OP_RESP" | python3 -c \
+        "import json,sys; print(json.load(sys.stdin).get('Status','UNKNOWN'))" 2>/dev/null)" || OP_STATUS="UNKNOWN"
+
+      echo "  Status: $OP_STATUS (elapsed: ${ELAPSED}s)"
+
+      if [[ "$OP_STATUS" == "SUCCESSFUL" ]]; then
+        break
+      elif [[ "$OP_STATUS" == "FAILED" || "$OP_STATUS" == "ERROR" ]]; then
+        break
+      fi
+
+      sleep "$SLEEP_SECS"
+      ELAPSED=$((ELAPSED + SLEEP_SECS))
+    done
+
+    if [[ "$OP_STATUS" != "SUCCESSFUL" ]]; then
+      echo "  WARNING: Transfer operation did not complete successfully (status: $OP_STATUS)."
+      echo "  The nameserver update below may fail if the domain is not yet in this account."
+      echo "  You can retry manually once the transfer completes:"
+    fi
+  fi
+
+  # Build the nameservers JSON array from the space-separated NS list.
+  if [[ -z "$ZONE_NS" ]]; then
+    echo "  WARNING: No nameserver values found for zone $ZONE_ID — fetching now..."
+    ZONE_NS="$(aws route53 list-resource-record-sets \
+      --hosted-zone-id "$ZONE_ID" \
+      --query "ResourceRecordSets[?Type=='NS'].ResourceRecords[].Value" \
+      --output text 2>/dev/null)" || ZONE_NS=""
+  fi
+
+  if [[ -z "$ZONE_NS" ]]; then
+    echo "  ERROR: Cannot determine nameservers for zone $ZONE_ID. Skipping nameserver update."
+    echo "  Manual command once you know the NS values:"
+    echo "    aws route53domains update-domain-nameservers --region us-east-1 \\"
+    echo "      --domain-name \"$DOMAIN\" \\"
+    echo "      --nameservers '[{\"Name\":\"ns-?.awsdns-?.net\"}, ...]'"
+    NS_FAIL=$((NS_FAIL+1))
+    continue
+  fi
+
+  # Convert whitespace-separated NS list to JSON array of {Name: ...} objects.
+  NS_JSON="$(echo "$ZONE_NS" | python3 -c "
+import sys, json
+# Strip trailing dots that Route 53 sometimes appends.
+vals = [v.rstrip('.') for v in sys.stdin.read().split() if v]
+print(json.dumps([{'Name': v} for v in vals]))
+" 2>/dev/null)" || NS_JSON="[]"
+
+  echo "  Updating domain nameservers to: $ZONE_NS"
+  echo "  Manual equivalent:"
+  echo "    aws route53domains update-domain-nameservers --region us-east-1 \\"
+  echo "      --domain-name \"$DOMAIN\" --nameservers '$NS_JSON'"
+
+  NS_RESP="$(aws route53domains --region us-east-1 update-domain-nameservers \
+    --domain-name "$DOMAIN" \
+    --nameservers "$NS_JSON" \
+    --output json 2>&1)" || {
+    echo "  ERROR updating nameservers for $DOMAIN:"
+    echo "  $NS_RESP"
+    echo "  Retry the manual command above once the domain transfer has completed."
+    NS_FAIL=$((NS_FAIL+1))
+    continue
+  }
+
+  echo "  Nameservers updated successfully. Response: $NS_RESP"
+  NS_SUCCESS=$((NS_SUCCESS+1))
+done
+
+echo
+echo "==================== Final Summary ===================="
+echo "Phase 1 (accept + zone create + DNS restore):"
+echo "  Succeeded: $SUCCESS    Failed: $FAIL"
+echo "Phase 2 (nameserver updates):"
+echo "  Succeeded: $NS_SUCCESS    Failed/Skipped: $NS_FAIL"
+PHASE2
+
 } | tee "$TARGET_SCRIPT_FILE"
 
 echo
