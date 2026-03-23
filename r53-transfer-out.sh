@@ -405,8 +405,8 @@ echo
   echo "DryRun: $DRY_RUN"
   echo "DNSExport: $([[ $NO_DNS_EXPORT -eq 1 ]] && echo disabled || echo enabled)"
   echo
-  printf "DOMAIN\tPASSWORD\tOPERATION_ID\n"
-  printf -- "------\t--------\t------------\n"
+  printf "DOMAIN\tPASSWORD\tSOURCE_OPERATION_ID\n"
+  printf -- "------\t--------\t-------------------\n"
   for row in "${SUCCESS_ROWS[@]}"; do
     printf "%s\n" "$row"
   done
@@ -621,7 +621,7 @@ fi
 # bash strings and survives clipboard, CloudShell browser upload, and cloud sync unchanged.
 EMBED_DOMAINS=()
 EMBED_PASSWORDS_B64=()
-EMBED_OPIDS=()
+EMBED_SOURCE_OPIDS=()
 for row in "${SUCCESS_ROWS[@]}"; do
   domain="${row%%$'\t'*}"
   rest="${row#*$'\t'}"
@@ -632,7 +632,7 @@ for row in "${SUCCESS_ROWS[@]}"; do
   pass_b64="$(printf '%s' "$pass" | base64 | tr -d '\n')"
   EMBED_DOMAINS+=("\"${domain_esc}\"")
   EMBED_PASSWORDS_B64+=("\"${pass_b64}\"")
-  EMBED_OPIDS+=("\"${opid_esc}\"")
+  EMBED_SOURCE_OPIDS+=("\"${opid_esc}\"")
 done
 
 # tee writes into the atomically-created 700-permission TARGET_SCRIPT_FILE, preserving its permissions.
@@ -685,8 +685,8 @@ FUNCS
   echo ")"
   echo
 
-  echo "OPIDS=("
-  for o in "${EMBED_OPIDS[@]}"; do
+  echo "SOURCE_OPIDS=("
+  for o in "${EMBED_SOURCE_OPIDS[@]}"; do
     echo "  $o"
   done
   echo ")"
@@ -706,9 +706,10 @@ FUNCS
 SUCCESS=0
 FAIL=0
 
-# NEW_ZONE_IDS and NEW_ZONE_NS are populated during Phase 1 and consumed in Phase 2.
-NEW_ZONE_IDS=()   # hosted zone ID (without /hostedzone/ prefix) for each domain
-NEW_ZONE_NS=()    # space-separated NS values for each domain
+# NEW_ZONE_IDS, NEW_ZONE_NS, and ACCEPT_OPIDS are populated during Phase 1 and consumed in Phase 2.
+NEW_ZONE_IDS=()    # hosted zone ID (without /hostedzone/ prefix) for each domain
+NEW_ZONE_NS=()     # space-separated NS values for each domain
+ACCEPT_OPIDS=()    # OperationId from accept-domain-transfer call (this account; used for polling)
 
 for i in "${!DOMAINS[@]}"; do
   DOMAIN="${DOMAINS[$i]}"
@@ -720,6 +721,7 @@ for i in "${!DOMAINS[@]}"; do
   # Step 1: Accept the domain transfer from the source account.
   # ------------------------------------------------------------------
   echo "  [1/3] Accepting domain transfer..."
+  echo "  Source account OperationId (for reference in source account): ${SOURCE_OPIDS[$i]:-<none>}"
   ACCEPT_RESP="$(aws route53domains --region us-east-1 \
     accept-domain-transfer-from-another-aws-account \
     --domain-name "$DOMAIN" \
@@ -730,9 +732,13 @@ for i in "${!DOMAINS[@]}"; do
     FAIL=$((FAIL+1))
     NEW_ZONE_IDS+=("")
     NEW_ZONE_NS+=("")
+    ACCEPT_OPIDS+=("")
     continue
   }
-  echo "  Accepted. Response: $ACCEPT_RESP"
+  ACCEPT_OPID="$(echo "$ACCEPT_RESP" | python3 -c \
+    "import json,sys; print(json.load(sys.stdin).get('OperationId',''))" 2>/dev/null)" || ACCEPT_OPID=""
+  ACCEPT_OPIDS+=("$ACCEPT_OPID")
+  echo "  Accepted. Accept OperationId (this account): ${ACCEPT_OPID:-<none>}"
 
   # ------------------------------------------------------------------
   # Step 2: Create a new hosted zone in this (target) account.
@@ -871,12 +877,14 @@ NS_FAIL=0
 
 for i in "${!DOMAINS[@]}"; do
   DOMAIN="${DOMAINS[$i]}"
-  OPID="${OPIDS[$i]}"
+  SOURCE_OPID="${SOURCE_OPIDS[$i]:-}"
+  ACCEPT_OPID="${ACCEPT_OPIDS[$i]:-}"
   ZONE_ID="${NEW_ZONE_IDS[$i]:-}"
   ZONE_NS="${NEW_ZONE_NS[$i]:-}"
 
   echo "----"
   echo "Domain: $DOMAIN"
+  [[ -n "$SOURCE_OPID" ]] && echo "  Source account OperationId (for checking in source account): $SOURCE_OPID"
 
   if [[ -z "$ZONE_ID" ]]; then
     echo "  Skipping nameserver update — no hosted zone was created for this domain."
@@ -884,8 +892,8 @@ for i in "${!DOMAINS[@]}"; do
     continue
   fi
 
-  if [[ -z "$OPID" ]]; then
-    echo "  WARNING: No OperationId recorded for this domain — skipping transfer poll."
+  if [[ -z "$ACCEPT_OPID" ]]; then
+    echo "  WARNING: No accept OperationId recorded for this domain — skipping transfer poll."
     echo "  Attempting nameserver update directly..."
   else
     # Poll operation status until SUCCESSFUL, FAILED, or timeout (30 min).
@@ -893,10 +901,10 @@ for i in "${!DOMAINS[@]}"; do
     SLEEP_SECS=30
     ELAPSED=0
     OP_STATUS="UNKNOWN"
-    echo "  Polling transfer OperationId: $OPID"
+    echo "  Polling accept OperationId (this account): $ACCEPT_OPID"
     while [[ $ELAPSED -lt $TIMEOUT_SECS ]]; do
       OP_RESP="$(aws route53domains --region us-east-1 get-operation-detail \
-        --operation-id "$OPID" --output json 2>/dev/null)" || OP_RESP="{}"
+        --operation-id "$ACCEPT_OPID" --output json 2>/dev/null)" || OP_RESP="{}"
       OP_STATUS="$(echo "$OP_RESP" | python3 -c \
         "import json,sys; print(json.load(sys.stdin).get('Status','UNKNOWN'))" 2>/dev/null)" || OP_STATUS="UNKNOWN"
 
@@ -914,6 +922,7 @@ for i in "${!DOMAINS[@]}"; do
 
     if [[ "$OP_STATUS" != "SUCCESSFUL" ]]; then
       echo "  WARNING: Transfer operation did not complete successfully (status: $OP_STATUS)."
+      [[ -n "$SOURCE_OPID" ]] && echo "  To check the outgoing transfer in the SOURCE account: aws route53domains --region us-east-1 get-operation-detail --operation-id \"$SOURCE_OPID\""
       echo "  The nameserver update below may fail if the domain is not yet in this account."
       echo "  You can retry manually once the transfer completes:"
     fi
@@ -947,6 +956,7 @@ print(json.dumps([{'Name': v} for v in vals]))
 " 2>/dev/null)" || NS_JSON="[]"
 
   echo "  Updating domain nameservers to: $ZONE_NS"
+  [[ -n "$SOURCE_OPID" ]] && echo "  # Source account OperationId (for correlation): $SOURCE_OPID"
   echo "  Manual equivalent:"
   echo "    aws route53domains update-domain-nameservers --region us-east-1 \\"
   echo "      --domain-name \"$DOMAIN\" --nameservers '$NS_JSON'"
