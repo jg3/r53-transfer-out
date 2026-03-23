@@ -547,6 +547,15 @@ print(next_type)
       RR_NEXT_NAME="$(echo "$MERGE_RESULT" | sed -n '3p')"
       RR_NEXT_TYPE="$(echo "$MERGE_RESULT" | sed -n '4p')"
 
+      # Guard against a silent Python parse failure: MERGE_RESULT empty means
+      # json.loads() failed (e.g. malformed AWS response). Break with a warning
+      # so the partial records collected so far are still exported.
+      if [[ -z "$ALL_RECORDS_JSON" ]]; then
+        echo "  WARNING: DNS record merge failed for $DOMAIN (malformed response page); exporting partial records."
+        ALL_RECORDS_JSON="[]"
+        break
+      fi
+
       [[ "$IS_TRUNC" != "True" ]] && break
     done
 
@@ -613,7 +622,6 @@ fi
 EMBED_DOMAINS=()
 EMBED_PASSWORDS_B64=()
 EMBED_OPIDS=()
-IDX=0
 for row in "${SUCCESS_ROWS[@]}"; do
   domain="${row%%$'\t'*}"
   rest="${row#*$'\t'}"
@@ -625,7 +633,6 @@ for row in "${SUCCESS_ROWS[@]}"; do
   EMBED_DOMAINS+=("\"${domain_esc}\"")
   EMBED_PASSWORDS_B64+=("\"${pass_b64}\"")
   EMBED_OPIDS+=("\"${opid_esc}\"")
-  IDX=$((IDX+1))
 done
 
 # tee writes into the atomically-created 700-permission TARGET_SCRIPT_FILE, preserving its permissions.
@@ -797,7 +804,7 @@ for i in "${!DOMAINS[@]}"; do
   echo "  Restoring $RECORD_COUNT record(s) in batches of 500..."
 
   # python3 builds and applies batches of up to 500 CREATE changes.
-  python3 - "$DNS_JSON" "$NEW_ZONE_ID" <<'PYEOF'
+  python3 - "$DNS_JSON" "$NEW_ZONE_ID" <<'PYEOF' && PY_STATUS=0 || PY_STATUS=$?
 import json, sys, subprocess, math
 
 records = json.loads(sys.argv[1])
@@ -837,8 +844,6 @@ if failed_batches:
 else:
     print(f"  All {len(records)} record(s) restored successfully.")
 PYEOF
-  # Capture python3 exit status without aborting the script (set -e).
-  PY_STATUS=$?
   if [[ $PY_STATUS -ne 0 ]]; then
     echo "  WARNING: DNS record restore encountered errors for $DOMAIN."
     FAIL=$((FAIL+1))
